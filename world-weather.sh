@@ -26,6 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DB_SCRIPT="${SCRIPT_DIR}/build_cities_db.py"
 QUERY_DB_SCRIPT="${SCRIPT_DIR}/query_cities.py"
 RECENT_DB_SCRIPT="${SCRIPT_DIR}/recent_cities.py"
+MOON_CALC_SCRIPT="${SCRIPT_DIR}/moon_calc.py"
 CACHE_EXPIRY_DAYS=30
 
 # Performance settings
@@ -271,19 +272,12 @@ get_aqi_data() {
     curl -s --max-time 10 "$url"
 }
 
-# Function to get moon data
-get_moon_data() {
-    local lat="$1"
-    local lon="$2"
-    
-    local url="https://api.open-meteo.com/v1/forecast"
-    url+="?latitude=$lat&longitude=$lon"
-    url+="&daily=moonrise,moonset,moon_phase,moon_illumination"
-    url+="&timezone=auto"
-    url+="&forecast_days=1"
-    
-    curl -s --max-time 10 "$url"
-}
+# Moon data (phase, illumination, moonrise/moonset) is no longer fetched
+# from Open-Meteo — that API's moon fields proved unreliable in practice
+# (see moon_calc.py's docstring for the full story). Instead we compute
+# it ourselves via moon_calc.py, a self-contained port of the SunCalc.js
+# astronomical algorithms: pure math from date + lat/lon, no network
+# call and nothing for a weather provider to not support.
 
 # Function to convert weather code to description with emoji
 get_weather_description() {
@@ -358,19 +352,19 @@ display_weather() {
     
     echo -e "${YELLOW}🔄 Fetching latest weather data...${NC}"
     
-    # Fetch all data in parallel using background processes
-    local weather_data aqi_data moon_data
+    # Fetch weather + AQI in parallel using background processes.
+    # Moon data is a local calculation (not a network call), and needs
+    # the timezone from weather_data first, so it happens afterward.
+    local weather_data aqi_data
     
     get_weather_data "$LAT" "$LON" > "${CACHE_DIR}/weather.json" &
     get_aqi_data "$LAT" "$LON" > "${CACHE_DIR}/aqi.json" &
-    get_moon_data "$LAT" "$LON" > "${CACHE_DIR}/moon.json" &
     
     # Wait for all background processes to complete
     wait
     
     weather_data=$(cat "${CACHE_DIR}/weather.json")
     aqi_data=$(cat "${CACHE_DIR}/aqi.json")
-    moon_data=$(cat "${CACHE_DIR}/moon.json")
     
     # Check if data was retrieved successfully
     if ! echo "$weather_data" | jq -e '.current' > /dev/null 2>&1; then
@@ -383,6 +377,10 @@ display_weather() {
     local current_time=$(TZ="$timezone" date '+%I:%M:%S %p')
     local current_date=$(TZ="$timezone" date '+%A, %B %d, %Y')
     local timezone_abbr=$(TZ="$timezone" date '+%Z')
+
+    # Moon data: local astronomical calculation, no network involved
+    local moon_data
+    moon_data=$(python3 "$MOON_CALC_SCRIPT" "$LAT" "$LON" "$timezone" 2>/dev/null || echo '{}')
     
     # Extract current weather
     local current_temp=$(echo "$weather_data" | jq -r '.current.temperature_2m')
@@ -443,11 +441,18 @@ display_weather() {
     local sunrise=$(echo "$weather_data" | jq -r '.daily.sunrise[0]' | awk -F'T' '{print $2}' 2>/dev/null || echo "N/A")
     local sunset=$(echo "$weather_data" | jq -r '.daily.sunset[0]' | awk -F'T' '{print $2}' 2>/dev/null || echo "N/A")
     
-    # Extract moon data
-    local moonrise=$(echo "$moon_data" | jq -r '.daily.moonrise[0]' | awk -F'T' '{print $2}' 2>/dev/null || echo "N/A")
-    local moonset=$(echo "$moon_data" | jq -r '.daily.moonset[0]' | awk -F'T' '{print $2}' 2>/dev/null || echo "N/A")
-    local moon_phase=$(echo "$moon_data" | jq -r '.daily.moon_phase[0] // 0')
-    local moon_illumination=$(echo "$moon_data" | jq -r '.daily.moon_illumination[0] // 0')
+    # Extract moon data (from moon_calc.py — a local calculation, not an API)
+    local moonrise=$(echo "$moon_data" | jq -r '.moonrise // "N/A"')
+    local moonset=$(echo "$moon_data" | jq -r '.moonset // "N/A"')
+    local moon_phase=$(echo "$moon_data" | jq -r '.phase // 0')
+    local moon_fraction=$(echo "$moon_data" | jq -r '.fraction // 0')
+    local moon_always_up=$(echo "$moon_data" | jq -r '.always_up // false')
+    local moon_always_down=$(echo "$moon_data" | jq -r '.always_down // false')
+    [ "$moon_always_up" = "true" ] && moonrise="Always up" && moonset="Always up"
+    [ "$moon_always_down" = "true" ] && moonrise="Doesn't rise today" && moonset="Doesn't rise today"
+    local moon_illumination
+    moon_illumination=$(echo "scale=0; $moon_fraction * 100" | bc | cut -d. -f1)
+    [ -z "$moon_illumination" ] && moon_illumination=0
     
     # Extract AQI
     local aqi=$(echo "$aqi_data" | jq -r '.current.us_aqi // .current.european_aqi // "N/A"')
